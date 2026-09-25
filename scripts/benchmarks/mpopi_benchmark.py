@@ -98,6 +98,8 @@ LOGGED_KEYS = (
 class BenchmarkCfg:
   task: str | None = None
   """mjlab task id. None uses the pure-torch point-mass toy env."""
+  device: str = "cpu"
+  """Torch / simulation device, e.g. "cpu" or "cuda:0"."""
   seeds: int = 10
   seed_offset: int = 0
   """First seed; use fresh seeds for confirmation runs."""
@@ -129,11 +131,11 @@ class BenchmarkCfg:
 
 def evaluate_toy(runner: MjlabOnPolicyRunner, cfg: BenchmarkCfg) -> float:
   """Mean undiscounted return of the deterministic policy from fixed starts."""
-  env = PointMassVecEnv(num_envs=cfg.eval_episodes, device="cpu")
-  env.pos = torch.linspace(-2.0, 2.0, cfg.eval_episodes).view(-1, 1)
+  env = PointMassVecEnv(num_envs=cfg.eval_episodes, device=cfg.device)
+  env.pos = torch.linspace(-2.0, 2.0, cfg.eval_episodes, device=cfg.device).view(-1, 1)
   policy = runner.alg.get_policy()
-  total = torch.zeros(cfg.eval_episodes)
-  alive = torch.ones(cfg.eval_episodes, dtype=torch.bool)
+  total = torch.zeros(cfg.eval_episodes, device=cfg.device)
+  alive = torch.ones(cfg.eval_episodes, dtype=torch.bool, device=cfg.device)
   with torch.inference_mode():
     for _ in range(cfg.episode_length):
       obs = env.get_observations()
@@ -146,17 +148,20 @@ def evaluate_toy(runner: MjlabOnPolicyRunner, cfg: BenchmarkCfg) -> float:
 
 @contextlib.contextmanager
 def _preserve_rng():
-  """Restore Python, NumPy and torch global RNG states on exit.
+  """Restore Python, NumPy and torch (CPU and CUDA) global RNG states on exit.
 
-  mjlab env construction calls ``seed_rng``, which reseeds all three globally.
+  mjlab env construction calls ``seed_rng``, which reseeds them globally.
   """
   states = (random.getstate(), np.random.get_state(), torch.get_rng_state())
+  cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
   try:
     yield
   finally:
     random.setstate(states[0])
     np.random.set_state(states[1])
     torch.set_rng_state(states[2])
+    if cuda_states is not None:
+      torch.cuda.set_rng_state_all(cuda_states)
 
 
 class TaskEvaluator:
@@ -176,7 +181,7 @@ class TaskEvaluator:
     env_cfg.seed = cfg.eval_seed
     self.eval_seed = cfg.eval_seed
     with _preserve_rng():
-      self.env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device="cpu"))
+      self.env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=cfg.device))
     self.steps = cfg.eval_steps
 
   def __call__(self, runner: MjlabOnPolicyRunner) -> float:
@@ -205,7 +210,10 @@ def _build(
   )
   if cfg.task is None:
     env = PointMassVecEnv(
-      num_envs=cfg.num_envs, max_episode_length=cfg.episode_length, seed=seed
+      num_envs=cfg.num_envs,
+      max_episode_length=cfg.episode_length,
+      device=cfg.device,
+      seed=seed,
     )
     agent = RslRlOnPolicyRunnerCfg(
       num_steps_per_env=cfg.num_steps_per_env or 16,
@@ -230,7 +238,7 @@ def _build(
     if cfg.num_steps_per_env is not None:
       agent.num_steps_per_env = cfg.num_steps_per_env
     env = RslRlVecEnvWrapper(
-      ManagerBasedRlEnv(cfg=env_cfg, device="cpu"),
+      ManagerBasedRlEnv(cfg=env_cfg, device=cfg.device),
       clip_actions=agent.clip_actions,
     )
   agent.seed = seed
@@ -245,7 +253,7 @@ def _build(
 def run_one(arm_name: str, seed: int, cfg: BenchmarkCfg) -> list[dict]:
   torch.manual_seed(seed)
   env, agent = _build(ARMS[arm_name], seed, cfg)
-  runner = MjlabOnPolicyRunner(env, asdict(agent), log_dir=None, device="cpu")
+  runner = MjlabOnPolicyRunner(env, asdict(agent), log_dir=None, device=cfg.device)
   env_steps_per_it = env.num_envs * agent.num_steps_per_env
 
   # Accumulate the per-step training reward of each rollout.
