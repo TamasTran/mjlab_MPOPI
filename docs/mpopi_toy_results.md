@@ -23,7 +23,7 @@ is one toy task. It is not evidence that MPOPI helps on robots.
 - Metrics: **AUC** = mean eval return over all iterations (sample efficiency).
   **Final** = mean over the last 10% of iterations. Higher is better.
 - Runs go through the real `MjlabOnPolicyRunner` mode switch.
-- Script: `scripts/benchmarks/mpopi_toy_benchmark.py`.
+- Script: `scripts/benchmarks/mpopi_benchmark.py`.
 
 Arm C and arm B use 2× the samples per gradient step at the same number of
 optimizer steps as A. This is inherent to replay, but it means "C beats A"
@@ -113,10 +113,10 @@ Not shown:
 ## Reproduce
 
 ```bash
-uv run --extra cpu python scripts/benchmarks/mpopi_toy_benchmark.py --seeds 10 --iterations 150 --out-dir logs/mpopi_toy/main
-uv run --extra cpu python scripts/benchmarks/mpopi_toy_benchmark.py --seeds 20 --seed-offset 10 --iterations 150 --arms A_ppo B_naive_replay C_mpopi --out-dir logs/mpopi_toy/confirm
-uv run --extra cpu python scripts/benchmarks/mpopi_toy_benchmark.py --seeds 10 --iterations 150 --arms B_naive_replay C_mpopi --replay-ratio 2.0 --out-dir logs/mpopi_toy/ratio_2
-uv run --extra cpu python scripts/benchmarks/mpopi_toy_benchmark.py --seeds 10 --iterations 150 --arms B_naive_replay C_mpopi --replay-buffer-size 8 --out-dir logs/mpopi_toy/buf_8
+uv run --extra cpu python scripts/benchmarks/mpopi_benchmark.py --seeds 10 --iterations 150 --out-dir logs/mpopi_toy/main
+uv run --extra cpu python scripts/benchmarks/mpopi_benchmark.py --seeds 20 --seed-offset 10 --iterations 150 --arms A_ppo B_naive_replay C_mpopi --out-dir logs/mpopi_toy/confirm
+uv run --extra cpu python scripts/benchmarks/mpopi_benchmark.py --seeds 10 --iterations 150 --arms B_naive_replay C_mpopi --replay-ratio 2.0 --out-dir logs/mpopi_toy/ratio_2
+uv run --extra cpu python scripts/benchmarks/mpopi_benchmark.py --seeds 10 --iterations 150 --arms B_naive_replay C_mpopi --replay-buffer-size 8 --out-dir logs/mpopi_toy/buf_8
 ```
 
 Each run takes about 14 s on CPU. Results are deterministic per seed on the
