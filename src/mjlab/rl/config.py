@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from typing import Any, Literal, Tuple
 
+from mjlab.rl.mpopi.config import MpopiCfg
+
 
 @dataclass
 class RslRlModelCfg:
@@ -79,6 +81,9 @@ class RslRlPpoAlgorithmCfg:
   """Share CNN encoders between actor and critic."""
   class_name: str = "PPO"
   """Algorithm class name resolved by RSL-RL."""
+  mpopi: MpopiCfg = field(default_factory=MpopiCfg)
+  """Experimental MPOPI replay correction. Disabled by default
+  (``mode="ppo"``), in which case PPO is constructed exactly as without it."""
 
 
 @dataclass

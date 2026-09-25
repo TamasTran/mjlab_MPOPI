@@ -29,6 +29,7 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
         if train_cfg[key].get("rnn_type") is None:
           for opt in ("rnn_type", "rnn_hidden_dim", "rnn_num_layers"):
             train_cfg[key].pop(opt, None)
+    _resolve_mpopi_mode(train_cfg)
     super().__init__(env, train_cfg, log_dir, device)
 
   def export_policy_to_onnx(
@@ -139,3 +140,28 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     if infos and "env_state" in infos:
       self.env.unwrapped.common_step_counter = infos["env_state"]["common_step_counter"]
     return infos
+
+
+MPOPI_PPO_CLASS_NAME = "mjlab.rl.mpopi:MpopiPpo"
+
+
+def _resolve_mpopi_mode(train_cfg: dict) -> None:
+  """Translate ``algorithm.mpopi.mode`` into the RSL-RL algorithm class.
+
+  In ``"ppo"`` mode the ``mpopi`` key is removed so the upstream ``PPO`` class
+  receives exactly the arguments it would without MPOPI. Otherwise the
+  algorithm class becomes :class:`mjlab.rl.mpopi.MpopiPpo`.
+  """
+  alg_cfg = train_cfg.get("algorithm")
+  if alg_cfg is None or "mpopi" not in alg_cfg:
+    return
+  mpopi_cfg = alg_cfg.pop("mpopi")
+  if mpopi_cfg is None or mpopi_cfg.get("mode", "ppo") == "ppo":
+    return
+  if alg_cfg.get("class_name", "PPO") not in ("PPO", MPOPI_PPO_CLASS_NAME):
+    raise ValueError(
+      f"MPOPI mode '{mpopi_cfg['mode']}' requires the PPO algorithm, got "
+      f"class_name='{alg_cfg['class_name']}'."
+    )
+  alg_cfg["class_name"] = MPOPI_PPO_CLASS_NAME
+  alg_cfg["mpopi"] = mpopi_cfg
