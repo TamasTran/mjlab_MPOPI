@@ -78,10 +78,12 @@ def test_replay_buffer_fifo_and_versions(models):
   # Content of the newest slot matches the last inserted segment.
   newest = slots[-1]
   torch.testing.assert_close(buffer.actions[newest], segments[4]["actions"])
+  stored_obs = buffer.observations
+  assert stored_obs is not None
   torch.testing.assert_close(
-    buffer.observations[newest]["actor"], segments[4]["observations"]["actor"]
+    stored_obs["actor"][newest], segments[4]["observations"]["actor"]
   )
-  assert buffer.observations.batch_size == torch.Size([3, NUM_STEPS, NUM_ENVS])
+  assert stored_obs.batch_size == torch.Size([3, NUM_STEPS, NUM_ENVS])
   buffer.clear()
   assert len(buffer) == 0
 
@@ -133,9 +135,7 @@ def test_replay_from_current_policy_matches_on_policy_targets(models):
   )
 
 
-@pytest.mark.parametrize(
-  "clip_max, expected", [(None, 2.0), (1.0, 1.0), (1.5, 1.5)]
-)
+@pytest.mark.parametrize("clip_max, expected", [(None, 2.0), (1.0, 1.0), (1.5, 1.5)])
 def test_known_ratio_is_weighted_and_clipped(models, clip_max, expected):
   actor, _ = models
   seg = _collect_segment(actor, seed=0)
@@ -148,9 +148,7 @@ def test_known_ratio_is_weighted_and_clipped(models, clip_max, expected):
   )
   batch, metrics = _process(models, cfg, [(0, seg)], version=1)
   assert batch is not None
-  torch.testing.assert_close(
-    batch.weights, torch.full_like(batch.weights, expected)
-  )
+  torch.testing.assert_close(batch.weights, torch.full_like(batch.weights, expected))
   assert metrics["raw_ratio_mean"] == pytest.approx(2.0)
   assert metrics["clipped_frac"] == (0.0 if clip_max is None else 1.0)
 

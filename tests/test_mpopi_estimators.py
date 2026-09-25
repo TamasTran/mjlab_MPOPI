@@ -67,9 +67,7 @@ def test_log_domain_matches_float64_reference():
   g = torch.Generator().manual_seed(0)
   target = torch.randn(1000, generator=g) * 5 - 300.0
   behavior = target + torch.randn(1000, generator=g) * 3
-  weights, _ = importance_weights(
-    importance_log_ratio(target, behavior), clip_max=None
-  )
+  weights, _ = importance_weights(importance_log_ratio(target, behavior), clip_max=None)
   expected = torch.exp(target.double() - behavior.double())
   # Naive probability division underflows to 0/0 here; the log domain does not.
   assert torch.isnan(torch.exp(target) / torch.exp(behavior)).all()
