@@ -5,6 +5,14 @@ Changelog
 Upcoming version (not yet released)
 -----------------------------------
 
+Added
+^^^^^
+
+- Experimental MPOPI replay correction for PPO (``mjlab.rl.mpopi``). Setting
+  ``--agent.algorithm.mpopi.mode`` to ``naive_replay_ppo`` or ``mpopi_ppo`` adds
+  importance-weighted samples from past rollouts to each PPO update. The default
+  ``ppo`` mode constructs RSL-RL's ``PPO`` exactly as before.
+
 Changed
 ^^^^^^^
 

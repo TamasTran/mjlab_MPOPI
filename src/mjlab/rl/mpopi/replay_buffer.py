@@ -1,5 +1,7 @@
 """GPU ring buffer of past rollout segments for MPOPI."""
 
+from typing import cast
+
 import torch
 from tensordict import TensorDict
 
@@ -80,8 +82,8 @@ class ReplayBuffer:
     assert self.observations is not None
     assert self.bootstrap_observations is not None
     i = self._next
-    self.observations[i].copy_(observations)
-    self.bootstrap_observations[i].copy_(bootstrap_observations)
+    self.observations[i] = observations
+    self.bootstrap_observations[i] = bootstrap_observations
     self.actions[i].copy_(actions)
     self.rewards[i].copy_(rewards.view_as(self.rewards[i]))
     self.dones[i].copy_(dones.view_as(self.dones[i]))
@@ -123,7 +125,8 @@ class ReplayBuffer:
     k, dev = self.capacity, self.device
     num_steps, num_envs = observations.batch_size[:2]
 
-    def _zeros_like(t: torch.Tensor) -> torch.Tensor:
+    def _zeros_like(t: object) -> torch.Tensor:
+      t = cast(torch.Tensor, t)  # Observation groups are flat tensors.
       return torch.zeros(k, *t.shape, dtype=t.dtype, device=dev)
 
     self.observations = TensorDict(

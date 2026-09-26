@@ -103,7 +103,7 @@ def vtrace(
   safe = torch.where(finite, log_ratio, torch.zeros_like(log_ratio))
   rhos = torch.exp(safe.clamp(-log_ratio_clamp, log_ratio_clamp))
   rhos = torch.where(finite, rhos, torch.zeros_like(rhos))
-  rho_bar = rhos.clamp(max=rho_clip)
+  rho_bar = rhos if rho_clip is None else rhos.clamp(max=rho_clip)
   cs = rhos.clamp(max=trace_clip)
   not_done = 1.0 - dones.float()
 

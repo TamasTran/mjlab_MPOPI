@@ -290,18 +290,19 @@ Insertion copies the fresh `RolloutStorage` tensors at the end of `update()`
 class Mpopi:
   def process(self, buffer, actor, critic, version) -> MpopiBatch: ...
 
+
 @dataclass
-class MpopiBatch:            # flat [n_replay] tensors
+class MpopiBatch:  # flat [n_replay] tensors
   observations: TensorDict
   actions: torch.Tensor
-  values: torch.Tensor                   # V_{φ_k}(s)
-  advantages: torch.Tensor               # Â (unnormalised)
-  returns: torch.Tensor                  # v (V-trace)
-  old_actions_log_prob: torch.Tensor     # log π_old(a|s)
-  old_distribution_params: tuple[torch.Tensor, ...]   # π_old
+  values: torch.Tensor  # V_{φ_k}(s)
+  advantages: torch.Tensor  # Â (unnormalised)
+  returns: torch.Tensor  # v (V-trace)
+  old_actions_log_prob: torch.Tensor  # log π_old(a|s)
+  old_distribution_params: tuple[torch.Tensor, ...]  # π_old
   behavior_actions_log_prob: torch.Tensor  # log μ(a|s)
-  weights: torch.Tensor                  # w̄ (1 in naive mode)
-  mask: torch.Tensor                     # accepted
+  weights: torch.Tensor  # w̄ (1 in naive mode)
+  mask: torch.Tensor  # accepted
   policy_age: torch.Tensor
   metrics: dict[str, float]
 ```
