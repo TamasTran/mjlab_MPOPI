@@ -116,6 +116,9 @@ class BenchmarkCfg:
   eval_steps: int = 200
   """Task only: control steps per evaluation rollout."""
   eval_seed: int = 10_000
+  progress_every: int = 10
+  """Print a progress line every N iterations (0 disables). Logging only;
+  results are unaffected."""
   """Task only: fixed seed so every arm and run sees the same eval starts."""
   replay_buffer_size: int = 4
   replay_ratio: float = 1.0
@@ -298,6 +301,10 @@ def run_one(arm_name: str, seed: int, cfg: BenchmarkCfg) -> list[dict]:
     }
     row.update({k: loss.get(k, math.nan) for k in LOGGED_KEYS})
     rows.append(row)
+    if cfg.progress_every > 0 and (
+      it % cfg.progress_every == 0 or it == cfg.iterations - 1
+    ):
+      _print_progress(arm_name, seed, it, cfg.iterations, rows)
 
   runner.logger.log = on_log  # type: ignore[method-assign]
   runner.learn(num_learning_iterations=cfg.iterations)
@@ -306,6 +313,27 @@ def run_one(arm_name: str, seed: int, cfg: BenchmarkCfg) -> list[dict]:
   if evaluator is not None:
     evaluator.close()
   return rows
+
+
+def _print_progress(arm: str, seed: int, it: int, total: int, rows: list[dict]) -> None:
+  """One-line training progress: latest eval score plus PPO/MPOPI diagnostics."""
+  row = rows[-1]
+  evals = [r["eval_return"] for r in rows if not math.isnan(r["eval_return"])]
+  parts = [
+    f"[{arm} seed {seed}] it {it + 1:>4}/{total}",
+    f"eval {evals[-1]:9.4f}" if evals else "eval       n/a",
+    f"train_r {row['train_reward']:8.4f}",
+  ]
+  for key, label in (
+    ("kl", "kl"),
+    ("clip_fraction", "clip"),
+    ("mpopi/ess", "ess"),
+    ("mpopi/weight_mean", "w"),
+    ("mpopi/behavior_kl", "kl_mu"),
+  ):
+    if not math.isnan(row[key]):
+      parts.append(f"{label} {row[key]:.3f}")
+  print("  ".join(parts), flush=True)
 
 
 def _ci95(x: list[float]) -> tuple[float, float]:
