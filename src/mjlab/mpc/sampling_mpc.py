@@ -13,6 +13,7 @@ them), so MPC actions and PPO actions are directly comparable.
 """
 
 import contextlib
+import copy
 import math
 import random
 from dataclasses import dataclass
@@ -20,41 +21,13 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from mjlab.envs import ManagerBasedRlEnv
-from mjlab.tasks.registry import load_env_cfg
+from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
+from mjlab.mpc.config import SamplingMpcCfg
 
 # Simulation fields that fully determine the next step for tasks without
 # stateful managers (e.g. Cartpole). Copying them reproduces the real env's
 # dynamics and rewards exactly (see tests/test_mpc_sampling.py).
 _STATE_FIELDS = ("qpos", "qvel", "act", "qacc_warmstart", "ctrl")
-
-
-@dataclass
-class SamplingMpcCfg:
-  num_samples: int = 64
-  """Action sequences per real env and iteration (K). Sample 0 is the
-  noise-free nominal plan."""
-  horizon: int = 20
-  """Planning horizon in control steps (H)."""
-  iterations: int = 1
-  """Sampling batches per control step (L). 1 = MPPI, > 1 = MPOPI."""
-  noise_std: float = 0.5
-  """Initial std of the action perturbations, in policy action units."""
-  target_ess: float | None = 0.1
-  """Normalized effective sample size the MPPI temperature is tuned to. None
-  uses the fixed ``temperature``."""
-  temperature: float = 0.1
-  """Fixed temperature when ``target_ess`` is None."""
-  action_clip: float | None = 1.0
-  """Clip sampled actions to ``[-x, x]``. None disables clipping."""
-  std_smoothing: float = 0.7
-  """MPOPI only: blend factor for the adapted std between iterations."""
-  min_std_scale: float = 0.2
-  """MPOPI only: lower bound on the adapted std, as a fraction of noise_std."""
-  max_std_scale: float = 3.0
-  """MPOPI only: upper bound on the adapted std, as a fraction of noise_std."""
-  seed: int = 0
-  """Seed of the planner's private random generator."""
 
 
 @dataclass
@@ -71,7 +44,7 @@ class MpcPlan:
 
 
 @contextlib.contextmanager
-def _preserve_global_rng():
+def preserve_global_rng():
   """mjlab env construction reseeds Python, NumPy and torch globally."""
   states = (random.getstate(), np.random.get_state(), torch.get_rng_state())
   cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
@@ -134,21 +107,29 @@ class SamplingMpc:
 
   def __init__(
     self,
-    task: str,
+    env_cfg: ManagerBasedRlEnvCfg,
     num_real: int,
     cfg: SamplingMpcCfg,
     device: str = "cpu",
   ) -> None:
+    """
+    Args:
+      env_cfg: Config of the task to plan on (copied, not modified). Use the
+        training config: the planner must see the same dynamics and rewards.
+      num_real: Number of real envs the planner controls.
+      cfg: Planner config.
+      device: Torch / simulation device.
+    """
     if cfg.iterations < 1 or cfg.num_samples < 2 or cfg.horizon < 1:
       raise ValueError("Need iterations >= 1, num_samples >= 2 and horizon >= 1.")
     self.cfg = cfg
     self.num_real = num_real
     self.device = torch.device(device)
-    env_cfg = load_env_cfg(task)
+    env_cfg = copy.deepcopy(env_cfg)
     env_cfg.scene.num_envs = num_real * cfg.num_samples
     env_cfg.auto_reset = False
     env_cfg.terminations = {}  # Every sample is rolled out for the full horizon.
-    with _preserve_global_rng():
+    with preserve_global_rng():
       self.env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
       self.env.reset()
     self.action_dim = self.env.action_manager.total_action_dim

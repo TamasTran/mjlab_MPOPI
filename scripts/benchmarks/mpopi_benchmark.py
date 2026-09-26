@@ -1,4 +1,4 @@
-"""Benchmark: PPO vs naive replay + PPO vs MPOPI + PPO.
+"""Benchmark: PPO vs naive replay + PPO vs MPOPI + PPO vs MPC-guided PPO.
 
 Runs every arm for several seeds through the real ``MjlabOnPolicyRunner`` /
 mode switch and reports a per-iteration score, its area under the curve
@@ -43,6 +43,7 @@ import tyro
 from rsl_rl.env import VecEnv
 from scipy import stats
 
+from mjlab.mpc import SamplingMpcCfg
 from mjlab.rl import (
   RslRlModelCfg,
   RslRlOnPolicyRunnerCfg,
@@ -50,6 +51,7 @@ from mjlab.rl import (
   RslRlVecEnvWrapper,
 )
 from mjlab.rl.mpopi import MpopiCfg
+from mjlab.rl.mpopi.config import MpcDataCfg
 from mjlab.rl.mpopi.toy_env import PointMassVecEnv
 from mjlab.rl.runner import MjlabOnPolicyRunner
 
@@ -60,6 +62,8 @@ class Arm:
   minibatch_divisor: int = 1
   """Divides ``num_mini_batches``. 2 gives PPO the same samples per gradient
   step as replay ratio 1.0 (a compute-matched control), with half the steps."""
+  mpc_overrides: tuple[tuple[str, object], ...] = ()
+  """``mpc_ppo`` arms: fields of ``BenchmarkCfg.mpc`` changed for this arm."""
 
 
 ARMS: dict[str, Arm] = {
@@ -68,6 +72,13 @@ ARMS: dict[str, Arm] = {
   "B_naive_replay": Arm(MpopiCfg(mode="naive_replay_ppo")),
   "C_mpopi": Arm(MpopiCfg(mode="mpopi_ppo")),
   "C_mpopi_noclip": Arm(MpopiCfg(mode="mpopi_ppo", importance_weight_clip_max=None)),
+  # MPC-generated data (mjlab tasks only).
+  "D_mpc_ppo": Arm(MpopiCfg(mode="mpc_ppo")),
+  "D_mpc_naive": Arm(MpopiCfg(mode="mpc_ppo"), mpc_overrides=(("correction", False),)),
+  "D_mpc_bc_only": Arm(
+    MpopiCfg(mode="mpc_ppo"), mpc_overrides=(("use_in_ppo", False),)
+  ),
+  "D_mpc_no_bc": Arm(MpopiCfg(mode="mpc_ppo"), mpc_overrides=(("bc_coef", 0.0),)),
 }
 
 TESTS = (
@@ -77,6 +88,12 @@ TESTS = (
   ("B_naive_replay", "A_ppo"),
   ("A_ppo_bigmb", "A_ppo"),
   ("C_mpopi_noclip", "C_mpopi"),
+  ("D_mpc_ppo", "A_ppo"),
+  ("D_mpc_ppo", "D_mpc_naive"),
+  ("D_mpc_ppo", "D_mpc_bc_only"),
+  ("D_mpc_ppo", "D_mpc_no_bc"),
+  ("D_mpc_bc_only", "A_ppo"),
+  ("D_mpc_no_bc", "A_ppo"),
 )
 
 LOGGED_KEYS = (
@@ -91,6 +108,9 @@ LOGGED_KEYS = (
   "mpopi/clipped_frac",
   "mpopi/behavior_kl",
   "mpopi/policy_age_mean",
+  "mpc/bc_loss",
+  "mpc/collect_reward",
+  "mpc/collect_seconds",
 )
 
 
@@ -130,6 +150,19 @@ class BenchmarkCfg:
     )
   )
   """PPO hyperparameters for the toy env (tasks use their registered ones)."""
+  mpc: MpcDataCfg = field(
+    default_factory=lambda: MpcDataCfg(
+      num_envs=8,
+      num_steps=16,
+      collect_iterations=20,
+      buffer_segments=8,
+      max_age=10,
+      bc_iterations=30,
+      planner=SamplingMpcCfg(num_samples=32, horizon=20),
+    )
+  )
+  """MPC data source of the ``D_*`` arms. The planner defaults score 0.92 as a
+  controller on Cartpole (``scripts/mpc/eval_mpc.py``, 8 envs)."""
 
 
 def evaluate_toy(runner: MjlabOnPolicyRunner, cfg: BenchmarkCfg) -> float:
@@ -210,6 +243,7 @@ def _build(
     arm.mpopi,
     replay_buffer_size=cfg.replay_buffer_size,
     replay_ratio=cfg.replay_ratio,
+    mpc=replace(cfg.mpc, **dict(arm.mpc_overrides)),  # type: ignore[arg-type]
   )
   if cfg.task is None:
     env = PointMassVecEnv(
@@ -307,7 +341,14 @@ def run_one(arm_name: str, seed: int, cfg: BenchmarkCfg) -> list[dict]:
       _print_progress(arm_name, seed, it, cfg.iterations, rows)
 
   runner.logger.log = on_log  # type: ignore[method-assign]
+  start = time.time()
   runner.learn(num_learning_iterations=cfg.iterations)
+  seconds = time.time() - start
+  for row in rows:
+    row["run_seconds"] = seconds
+  collector = getattr(runner.alg, "mpc_collector", None)
+  if collector is not None:
+    collector.close()
   if isinstance(env, RslRlVecEnvWrapper):
     env.close()
   if evaluator is not None:
@@ -327,6 +368,8 @@ def _print_progress(arm: str, seed: int, it: int, total: int, rows: list[dict]) 
   for key, label in (
     ("kl", "kl"),
     ("clip_fraction", "clip"),
+    ("mpc/bc_loss", "bc"),
+    ("mpc/collect_reward", "mpc_r"),
     ("mpopi/ess", "ess"),
     ("mpopi/weight_mean", "w"),
     ("mpopi/behavior_kl", "kl_mu"),
@@ -371,10 +414,21 @@ def summarize(rows: list[dict], cfg: BenchmarkCfg) -> dict:
     for key in LOGGED_KEYS:
       vals = [r[key] for v in seeds.values() for r in v if not math.isnan(r[key])]
       diag[key] = sum(vals) / len(vals) if vals else math.nan
+    mpc_seconds = [
+      sum(
+        r["mpc/collect_seconds"] for r in v if not math.isnan(r["mpc/collect_seconds"])
+      )
+      for v in seeds.values()
+    ]
     summary[arm] = {
       m: dict(zip(("mean", "ci95"), _ci95(v), strict=True))
       for m, v in values[arm].items()
-    } | {"per_seed": values[arm], "diagnostics_mean": diag}
+    } | {
+      "per_seed": values[arm],
+      "diagnostics_mean": diag,
+      "run_seconds_mean": sum(v[0]["run_seconds"] for v in seeds.values()) / len(seeds),
+      "mpc_collect_seconds_mean": sum(mpc_seconds) / len(mpc_seconds),
+    }
 
   tests = {}
   for a, b in TESTS:
@@ -417,12 +471,13 @@ def main(cfg: BenchmarkCfg) -> None:
   (cfg.out_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
   print(f"\nScore = {summary['score']} (higher is better), mean ± 95% CI")
-  print(f"{'arm':>16} {'AUC':>20} {'final':>20}")
+  print(f"{'arm':>16} {'AUC':>20} {'final':>20} {'run s':>8} {'MPC s':>8}")
   for arm in cfg.arms:
     s = summary[arm]
     print(
       f"{arm:>16} {s['auc']['mean']:10.4f} ± {s['auc']['ci95']:7.4f}"
       f" {s['final']['mean']:10.4f} ± {s['final']['ci95']:7.4f}"
+      f" {s['run_seconds_mean']:8.1f} {s['mpc_collect_seconds_mean']:8.1f}"
     )
   print("\nTests (two-sided)")
   for name, t in summary["tests"].items():

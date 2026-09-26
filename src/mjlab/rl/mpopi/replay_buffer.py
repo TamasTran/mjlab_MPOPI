@@ -110,6 +110,14 @@ class ReplayBuffer:
         out.append(i)
     return sorted(out, key=lambda i: int(self.policy_version[i]))
 
+  def evict_older_than(self, current_version: int, max_age: int) -> int:
+    """Free slots with ``age > max_age``. Returns the number evicted."""
+    age = current_version - self.policy_version
+    stale = self.occupied & (age > max_age)
+    self.occupied &= ~stale
+    self.policy_version[stale] = -1
+    return int(stale.sum())
+
   def clear(self) -> None:
     self.occupied.zero_()
     self.policy_version.fill_(-1)

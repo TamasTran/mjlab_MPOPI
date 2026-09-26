@@ -10,16 +10,22 @@ rollout and optimized with PPO's clipped objective.
 because the upstream loss is inline and has no hook for per-sample weights.
 When no replay sample is available it takes exactly the upstream code path, so
 the resulting parameters are identical to plain PPO.
+
+In mode ``"mpc_ppo"`` the replay source is MPC-generated data instead of past
+PPO rollouts: an attached :class:`mjlab.mpc.collector.MpcCollector` fills a
+separate buffer, the same MPOPI estimators correct it, and an annealed
+behavior-cloning term pulls the policy mean toward the MPC action.
 """
 
-from dataclasses import asdict
-from typing import Any, Generator, cast
+from dataclasses import asdict, replace
+from typing import Any, Generator, Protocol, cast
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from rsl_rl.algorithms import PPO
 from rsl_rl.models import MLPModel
+from rsl_rl.modules import GaussianDistribution
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
@@ -28,6 +34,14 @@ from mjlab.rl.mpopi.mpopi import Mpopi, MpopiBatch
 from mjlab.rl.mpopi.replay_buffer import ReplayBuffer
 
 _Pool = dict[str, Any]
+
+
+class MpcDataSource(Protocol):
+  """What ``MpopiPpo`` needs from an MPC collector."""
+
+  def collect(self) -> tuple[dict, dict[str, float]]: ...
+
+  def close(self) -> None: ...
 
 
 class MpopiPpo(PPO):
@@ -43,20 +57,40 @@ class MpopiPpo(PPO):
   ) -> None:
     super().__init__(actor, critic, storage, **kwargs)
     if isinstance(mpopi, dict):
-      mpopi = MpopiCfg(**cast(dict[str, Any], mpopi))
+      mpopi = MpopiCfg.from_dict(cast(dict[str, Any], mpopi))
     cfg = mpopi if mpopi is not None else MpopiCfg(mode="mpopi_ppo")
     if actor.is_recurrent or critic.is_recurrent:
       raise ValueError("MPOPI does not support recurrent actors or critics.")
     if self.rnd is not None or self.symmetry is not None:
       raise ValueError("MPOPI does not support RND or symmetry augmentation.")
     self.mpopi_cfg = cfg
-    self.mpopi = Mpopi(cfg, gamma=self.gamma, lam=self.lam)
-    self.replay = ReplayBuffer(cfg.replay_buffer_size, device=self.device)
     self.policy_version = 0
+    self.mpc_cfg = cfg.mpc if cfg.mode == "mpc_ppo" else None
+    self.mpc_collector: MpcDataSource | None = None
+    if self.mpc_cfg is None:
+      self.mpopi = Mpopi(cfg, gamma=self.gamma, lam=self.lam)
+      self.replay = ReplayBuffer(cfg.replay_buffer_size, device=self.device)
+    else:
+      cfg.validate()
+      if not isinstance(actor.distribution, GaussianDistribution):
+        raise ValueError("mpc_ppo requires a Gaussian actor distribution.")
+      # MPC data reuses MPOPI's estimators; every segment in the buffer is used.
+      mode = "mpopi_ppo" if self.mpc_cfg.correction else "naive_replay_ppo"
+      mpc_mpopi_cfg = replace(
+        cfg, mode=mode, sampling_strategy="all", max_policy_age=None
+      )
+      self.mpopi = Mpopi(mpc_mpopi_cfg, gamma=self.gamma, lam=self.lam)
+      self.replay = ReplayBuffer(self.mpc_cfg.buffer_segments, device=self.device)
     shape = (storage.num_transitions_per_env, storage.num_envs, 1)
     self._raw_rewards = torch.zeros(shape, device=self.device)
     self._time_outs = torch.zeros(shape, dtype=torch.bool, device=self.device)
     self._bootstrap_obs: TensorDict | None = None
+
+  def attach_mpc_collector(self, collector: MpcDataSource) -> None:
+    """Set the MPC data source (mode ``"mpc_ppo"`` only)."""
+    if self.mpc_cfg is None:
+      raise ValueError("An MPC collector requires mode 'mpc_ppo'.")
+    self.mpc_collector = collector
 
   # Rollout hooks.
 
@@ -86,13 +120,29 @@ class MpopiPpo(PPO):
   def update(self) -> dict[str, float]:
     st = self.storage
     num_fresh = st.num_envs * st.num_transitions_per_env
-    replay, mpopi_metrics = self.mpopi.process(
-      self.replay, self.actor, self.critic, self.policy_version, num_fresh
-    )
-    if replay is not None and not bool(replay.mask.any()):
+    bc_weight = 0.0
+    mpc_metrics: dict[str, float] = {}
+    if self.mpc_cfg is not None:
+      mpc_metrics = self._refresh_mpc_buffer()
+      bc_weight = self.mpc_cfg.bc_weight(self.policy_version)
+      use_in_ppo = self.mpc_cfg.use_in_ppo
+    else:
+      use_in_ppo = True
+    if use_in_ppo or bc_weight > 0.0:
+      replay, mpopi_metrics = self.mpopi.process(
+        self.replay, self.actor, self.critic, self.policy_version, num_fresh
+      )
+    else:
+      replay, mpopi_metrics = None, {}
+    if replay is not None and not use_in_ppo:
+      # Behavior cloning only: MPC samples stay out of PPO's losses.
+      replay.mask = torch.zeros_like(replay.mask)
+      replay.weights = torch.zeros_like(replay.weights)
+    if replay is not None and not bool(replay.mask.any()) and bc_weight == 0.0:
       replay = None  # Everything rejected: fall back to plain PPO.
     pool = self._build_pool(replay)
     weighted = replay is not None
+    mean_bc_loss = 0.0
 
     mean_value_loss = 0.0
     mean_surrogate_loss = 0.0
@@ -100,7 +150,7 @@ class MpopiPpo(PPO):
     mean_kl = 0.0
     mean_clip_fraction = 0.0
 
-    for batch, weights, mask in self._mini_batch_generator(pool):
+    for batch, weights, mask, bc in self._mini_batch_generator(pool):
       if self.normalize_advantage_per_mini_batch:
         with torch.no_grad():
           batch.advantages = _normalize(batch.advantages, mask)  # type: ignore[arg-type]
@@ -153,6 +203,12 @@ class MpopiPpo(PPO):
           + self.value_loss_coef * value_loss
           - self.entropy_coef * entropy_mean
         )
+        if bc_weight > 0.0 and bc is not None:
+          bc_target, bc_mask = bc
+          bc_error = (distribution_params[0] - bc_target).square().mean(dim=-1)
+          bc_loss = _mean(bc_error, bc_mask)
+          loss = loss + bc_weight * bc_loss
+          mean_bc_loss += bc_loss.item()
 
       self.optimizer.zero_grad()
       loss.backward()
@@ -186,11 +242,31 @@ class MpopiPpo(PPO):
     num_accepted = int(replay.mask.sum()) if replay is not None else 0
     mpopi_metrics["gradient_samples"] = float(num_fresh + num_accepted)
     loss_dict.update({f"mpopi/{k}": v for k, v in mpopi_metrics.items()})
-
-    self._store_fresh_segment()
+    if self.mpc_cfg is not None:
+      mpc_metrics["bc_weight"] = bc_weight
+      mpc_metrics["bc_loss"] = mean_bc_loss / num_updates
+      loss_dict.update({f"mpc/{k}": v for k, v in mpc_metrics.items()})
+    else:
+      self._store_fresh_segment()
     self.policy_version += 1
     st.clear()
     return loss_dict
+
+  def _refresh_mpc_buffer(self) -> dict[str, float]:
+    """Collect a new MPC segment when scheduled and drop stale ones."""
+    cfg, version = self.mpc_cfg, self.policy_version
+    assert cfg is not None
+    metrics: dict[str, float] = {}
+    if cfg.collects(version):
+      if self.mpc_collector is None:
+        raise RuntimeError("mpc_ppo needs attach_mpc_collector() before training.")
+      segment, collect_metrics = self.mpc_collector.collect()
+      self.replay.insert(**segment, policy_version=version)
+      metrics.update({f"collect_{k}": v for k, v in collect_metrics.items()})
+    if cfg.max_age is not None:
+      self.replay.evict_older_than(version, cfg.max_age)
+    metrics["buffer_segments"] = float(len(self.replay))
+    return metrics
 
   def save(self) -> dict:
     saved = super().save()
@@ -230,6 +306,7 @@ class MpopiPpo(PPO):
       "old_distribution_params": tuple(p.flatten(0, 1) for p in st.distribution_params),
       "weights": None,
       "mask": None,
+      "bc": None,
     }
     if replay is None:
       return fresh
@@ -263,12 +340,32 @@ class MpopiPpo(PPO):
       ),
       "weights": torch.cat([ones, replay.weights]),
       "mask": mask,
+      "bc": self._bc_targets(replay, num_fresh),
     }
+
+  def _bc_targets(
+    self, replay: MpopiBatch, num_fresh: int
+  ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Behavior-cloning targets (MPC mean action) and mask over the pool."""
+    if self.mpc_cfg is None:
+      return None
+    behavior_mean = replay.behavior_distribution_params[0]
+    target = torch.cat(
+      [behavior_mean.new_zeros(num_fresh, *behavior_mean.shape[1:]), behavior_mean]
+    )
+    is_mpc = torch.zeros(target.shape[0], 1, dtype=torch.bool, device=self.device)
+    is_mpc[num_fresh:] = True
+    return target, is_mpc
 
   def _mini_batch_generator(
     self, pool: _Pool
   ) -> Generator[
-    tuple[RolloutStorage.Batch, torch.Tensor | None, torch.Tensor | None],
+    tuple[
+      RolloutStorage.Batch,
+      torch.Tensor | None,
+      torch.Tensor | None,
+      tuple[torch.Tensor, torch.Tensor] | None,
+    ],
     None,
     None,
   ]:
@@ -296,7 +393,8 @@ class MpopiPpo(PPO):
         )
         weights = pool["weights"][idx] if pool["weights"] is not None else None
         mask = pool["mask"][idx] if pool["mask"] is not None else None
-        yield batch, weights, mask
+        bc = tuple(x[idx] for x in pool["bc"]) if pool["bc"] is not None else None
+        yield batch, weights, mask, bc
 
   def _store_fresh_segment(self) -> None:
     st = self.storage

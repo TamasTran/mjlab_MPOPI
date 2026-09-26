@@ -45,6 +45,7 @@ class MpopiBatch:
   old_actions_log_prob: torch.Tensor
   old_distribution_params: tuple[torch.Tensor, ...]
   behavior_actions_log_prob: torch.Tensor
+  behavior_distribution_params: tuple[torch.Tensor, ...]
   weights: torch.Tensor
   """Surrogate weights; 0 for rejected samples, 1 for accepted in naive mode."""
   mask: torch.Tensor
@@ -123,6 +124,7 @@ class Mpopi:
       idx = perm[: min(n_request, num_total)]
     s = {k: v[idx] for k, v in seg.items() if isinstance(v, torch.Tensor)}
     params = tuple(p[idx] for p in seg["old_distribution_params"])
+    behavior_params = tuple(p[idx] for p in seg["behavior_distribution_params"])
     observations = seg["observations"][idx]
 
     # Rejection masks. They are computed from the true ratio in both modes so
@@ -203,6 +205,7 @@ class Mpopi:
       old_actions_log_prob=s["old_actions_log_prob"],
       old_distribution_params=params,
       behavior_actions_log_prob=s["behavior_actions_log_prob"],
+      behavior_distribution_params=behavior_params,
       weights=weights,
       mask=mask,
       policy_age=s["policy_age"],
@@ -293,6 +296,9 @@ class Mpopi:
       "behavior_actions_log_prob": flat(beh_logp),
       "old_distribution_params": tuple(
         flat(torch.stack([p[j] for p in params])) for j in range(num_params)
+      ),
+      "behavior_distribution_params": tuple(
+        flat(p[slot_t]) for p in buffer.behavior_distribution_params
       ),
       "behavior_kl": torch.stack(kl).flatten(0, 2),
       "policy_age": flat(ages.expand(-1, num_steps, num_envs, 1)),

@@ -56,9 +56,8 @@ but has not been evaluated as a controller yet.
 uv run --extra cpu python scripts/mpc/eval_mpc.py --num-envs 16 --steps 200 --mpc.num-samples 64 --mpc.horizon 20
 ```
 
-## Next (stage 2 and 3)
+## Next
 
-- Record MPC data with a known behavior density: execute `a = u0 + σ·ε` and
-  store `log μ(a|s)` with the segment in the existing `ReplayBuffer`.
-- Connect it to PPO (`mpc_ppo` mode): behavior cloning, then PPO with
-  importance-corrected MPC data, then plain PPO.
+Stages 2 and 3 (MPC data collection and `mpc_ppo`) are in
+[`mpc_ppo_results.md`](mpc_ppo_results.md). `SamplingMpc` now takes an env
+config instead of a task id.

@@ -5,6 +5,7 @@ import torch
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
 
+from mjlab.rl.mpopi.algorithm import MpopiPpo
 from mjlab.rl.vecenv_wrapper import RslRlVecEnvWrapper
 
 
@@ -31,6 +32,30 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
             train_cfg[key].pop(opt, None)
     _resolve_mpopi_mode(train_cfg)
     super().__init__(env, train_cfg, log_dir, device)
+    self._attach_mpc_collector()
+
+  def _attach_mpc_collector(self) -> None:
+    """In mode ``"mpc_ppo"``, give the algorithm an MPC collector on this task."""
+    alg = self.alg
+    if not isinstance(alg, MpopiPpo) or alg.mpc_cfg is None:
+      return
+    if not isinstance(self.env, RslRlVecEnvWrapper):
+      raise ValueError("mpc_ppo requires an mjlab environment.")
+    # Local import: mjlab.mpc.collector imports mjlab.rl (circular).
+    from mjlab.mpc.collector import MpcCollector
+
+    cfg = alg.mpc_cfg
+    collector = MpcCollector(
+      self.env.unwrapped.cfg,
+      num_envs=cfg.num_envs,
+      num_steps=cfg.num_steps,
+      planner_cfg=cfg.planner,
+      execution_std=cfg.execution_std,
+      clip_actions=self.env.clip_actions,
+      device=self.device,
+      seed=int(self.cfg.get("seed", 0)) + 1,  # Different starts from training.
+    )
+    alg.attach_mpc_collector(collector)
 
   def export_policy_to_onnx(
     self, path: str, filename: str = "policy.onnx", verbose: bool = False

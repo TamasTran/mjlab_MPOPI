@@ -1,10 +1,72 @@
 """Configuration for the experimental MPOPI off-policy correction layer."""
 
 import warnings
-from dataclasses import dataclass
-from typing import Literal
+from dataclasses import dataclass, field, fields
+from typing import Any, Literal
 
-MpopiMode = Literal["ppo", "naive_replay_ppo", "mpopi_ppo"]
+from mjlab.mpc.config import SamplingMpcCfg
+
+MpopiMode = Literal["ppo", "naive_replay_ppo", "mpopi_ppo", "mpc_ppo"]
+
+
+@dataclass
+class MpcDataCfg:
+  """MPC-generated data for PPO (mode ``"mpc_ppo"``).
+
+  A separate set of ``num_envs`` envs is driven by a sampling MPC controller
+  with Gaussian execution noise, so the behavior density ``mu`` is known. Each
+  PPO update adds the MPC segments in the buffer, importance-corrected by
+  MPOPI, plus an optional behavior-cloning term toward the MPC action that is
+  annealed to zero. Collection stops after ``collect_iterations`` so training
+  ends as plain PPO. Defaults are placeholders without empirical backing.
+  """
+
+  num_envs: int = 16
+  """Real envs driven by the MPC controller."""
+  num_steps: int = 24
+  """Control steps per collected segment."""
+  collect_every: int = 1
+  """Collect one segment every N PPO iterations."""
+  collect_iterations: int = 50
+  """Stop collecting after this many PPO iterations."""
+  execution_std: float = 0.3
+  """Std of the executed Gaussian noise around the MPC action, in policy
+  action units. Defines ``mu(a|s) = N(a; u0(s), execution_std^2)``."""
+  buffer_segments: int = 8
+  """MPC segments kept in the buffer (all of them are used at every update)."""
+  max_age: int | None = 10
+  """Segments collected more than this many iterations ago are not used."""
+  use_in_ppo: bool = True
+  """Add MPC samples to PPO's surrogate and value losses."""
+  correction: bool = True
+  """Importance-correct MPC samples (MPOPI). False treats them as on-policy."""
+  bc_coef: float = 1.0
+  """Initial weight of the behavior-cloning loss ``||mean_pi(s) - u0(s)||^2``
+  (mean over action dims) on MPC samples. 0 disables it."""
+  bc_iterations: int = 50
+  """The behavior-cloning weight decays linearly to 0 over this many
+  iterations."""
+  planner: SamplingMpcCfg = field(default_factory=SamplingMpcCfg)
+
+  def bc_weight(self, iteration: int) -> float:
+    if self.bc_iterations <= 0:
+      return 0.0
+    return self.bc_coef * max(0.0, 1.0 - iteration / self.bc_iterations)
+
+  def collects(self, iteration: int) -> bool:
+    return iteration < self.collect_iterations and iteration % self.collect_every == 0
+
+  def validate(self) -> None:
+    if self.num_envs < 1 or self.num_steps < 1 or self.collect_every < 1:
+      raise ValueError("num_envs, num_steps and collect_every must be >= 1.")
+    if self.execution_std <= 0.0:
+      raise ValueError("execution_std must be > 0.")
+    if self.buffer_segments < 1:
+      raise ValueError("buffer_segments must be >= 1.")
+    if self.max_age is not None and self.max_age < 0:
+      raise ValueError("max_age must be >= 0.")
+    if self.bc_coef < 0.0:
+      raise ValueError("bc_coef must be >= 0.")
 
 
 @dataclass
@@ -22,6 +84,8 @@ class MpopiCfg:
   - ``"naive_replay_ppo"``: replay data is added to PPO's batch as if it were
     on-policy (importance ratio forced to 1). Baseline for the correction.
   - ``"mpopi_ppo"``: replay data is importance-corrected by MPOPI.
+  - ``"mpc_ppo"``: no replay of PPO's own data; MPC-generated data (see
+    ``mpc``) is added instead, importance-corrected with the same estimators.
   """
   replay_buffer_size: int = 4
   """Number of past rollout segments (iterations) kept in the replay buffer.
@@ -54,6 +118,27 @@ class MpopiCfg:
   0 disables the gate."""
   weight_normalization: Literal["none", "self_normalized"] = "none"
   """``"self_normalized"`` rescales accepted replay weights to mean 1."""
+  mpc: MpcDataCfg = field(default_factory=MpcDataCfg)
+  """MPC data source; only used in mode ``"mpc_ppo"``."""
+
+  @classmethod
+  def from_dict(cls, data: dict[str, Any]) -> "MpopiCfg":
+    """Rebuild from ``dataclasses.asdict`` output (nested dicts included)."""
+    data = dict(data)
+    mpc = data.pop("mpc", None)
+    if isinstance(mpc, dict):
+      mpc = dict(mpc)
+      planner = mpc.pop("planner", None)
+      if isinstance(planner, dict):
+        mpc["planner"] = SamplingMpcCfg(**planner)
+      data["mpc"] = MpcDataCfg(**mpc)
+    elif mpc is not None:
+      data["mpc"] = mpc
+    known = {f.name for f in fields(cls)}
+    unknown = set(data) - known
+    if unknown:
+      raise TypeError(f"Unknown MpopiCfg fields: {sorted(unknown)}")
+    return cls(**data)
 
   @property
   def enabled(self) -> bool:
@@ -74,6 +159,8 @@ class MpopiCfg:
       raise ValueError("log_ratio_clamp must be > 0.")
     if self.trace_clip_max <= 0.0:
       raise ValueError("trace_clip_max must be > 0.")
+    if self.mode == "mpc_ppo":
+      self.mpc.validate()
     clip_max = self.importance_weight_clip_max
     if clip_max is not None:
       if clip_max <= self.importance_weight_clip_min:

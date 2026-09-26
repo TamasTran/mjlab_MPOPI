@@ -16,6 +16,11 @@ Added
   MPOPI option that adapts the sampling distribution within a control step,
   planning on a batched copy of an mjlab task with the task's own rewards.
   ``scripts/mpc/eval_mpc.py`` evaluates it as a controller.
+- Experimental MPC-guided PPO: ``--agent.algorithm.mpopi.mode mpc_ppo`` drives
+  extra envs with the sampling MPC (``mjlab.mpc.collector.MpcCollector``),
+  records the executed actions with their Gaussian behavior density, and adds
+  them to PPO's updates with MPOPI's importance correction plus an annealed
+  behavior-cloning term. Settings are under ``--agent.algorithm.mpopi.mpc``.
 
 Changed
 ^^^^^^^

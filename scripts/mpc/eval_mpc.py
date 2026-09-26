@@ -46,7 +46,7 @@ def run(cfg: EvalMpcCfg, controller: str) -> dict:
   env.reset()
   action_dim = env.action_manager.total_action_dim
   mpc = (
-    SamplingMpc(cfg.task, cfg.num_envs, cfg.mpc, device=cfg.device)
+    SamplingMpc(load_env_cfg(cfg.task), cfg.num_envs, cfg.mpc, device=cfg.device)
     if controller == "mpc"
     else None
   )

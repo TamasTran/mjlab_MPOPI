@@ -34,7 +34,10 @@ def real_env(device):
 @pytest.fixture(scope="module")
 def mpc(device):
   planner = SamplingMpc(
-    TASK, NUM_REAL, SamplingMpcCfg(num_samples=8, horizon=5, seed=0), device=device
+    load_env_cfg(TASK),
+    NUM_REAL,
+    SamplingMpcCfg(num_samples=8, horizon=5, seed=0),
+    device=device,
   )
   yield planner
   planner.close()
@@ -112,7 +115,7 @@ def test_planning_does_not_touch_global_rng(real_env, mpc):
 
 def test_mpopi_adapts_std_within_bounds(real_env, device):
   cfg = SamplingMpcCfg(num_samples=8, horizon=5, iterations=3, seed=0)
-  planner = SamplingMpc(TASK, NUM_REAL, cfg, device=device)
+  planner = SamplingMpc(load_env_cfg(TASK), NUM_REAL, cfg, device=device)
   try:
     plan = planner.plan(real_env)
   finally:
@@ -126,7 +129,10 @@ def test_same_seed_gives_same_plan(real_env, device):
   plans = []
   for _ in range(2):
     planner = SamplingMpc(
-      TASK, NUM_REAL, SamplingMpcCfg(num_samples=8, horizon=5, seed=3), device=device
+      load_env_cfg(TASK),
+      NUM_REAL,
+      SamplingMpcCfg(num_samples=8, horizon=5, seed=3),
+      device=device,
     )
     plans.append(planner.plan(real_env).action)
     planner.close()
