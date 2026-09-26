@@ -1,0 +1,228 @@
+"""Sampling-based MPC (MPPI / MPOPI) running on a batched mjlab planning env.
+
+The planner keeps a second copy of the task with ``num_real * num_samples``
+worlds. At every control step it copies the state of each real env into its
+``num_samples`` planning worlds, rolls out ``num_samples`` perturbed action
+sequences for ``horizon`` steps with the task's own reward manager, and
+combines them with path-integral (MPPI) weights. ``iterations > 1`` adapts the
+sampling distribution (mean and per-dimension std) between batches within the
+same control step (MPOPI); ``iterations == 1`` is plain MPPI.
+
+Actions live in the policy action space (before the action manager scales
+them), so MPC actions and PPO actions are directly comparable.
+"""
+
+import contextlib
+import math
+import random
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+
+from mjlab.envs import ManagerBasedRlEnv
+from mjlab.tasks.registry import load_env_cfg
+
+# Simulation fields that fully determine the next step for tasks without
+# stateful managers (e.g. Cartpole). Copying them reproduces the real env's
+# dynamics and rewards exactly (see tests/test_mpc_sampling.py).
+_STATE_FIELDS = ("qpos", "qvel", "act", "qacc_warmstart", "ctrl")
+
+
+@dataclass
+class SamplingMpcCfg:
+  num_samples: int = 64
+  """Action sequences per real env and iteration (K). Sample 0 is the
+  noise-free nominal plan."""
+  horizon: int = 20
+  """Planning horizon in control steps (H)."""
+  iterations: int = 1
+  """Sampling batches per control step (L). 1 = MPPI, > 1 = MPOPI."""
+  noise_std: float = 0.5
+  """Initial std of the action perturbations, in policy action units."""
+  target_ess: float | None = 0.1
+  """Normalized effective sample size the MPPI temperature is tuned to. None
+  uses the fixed ``temperature``."""
+  temperature: float = 0.1
+  """Fixed temperature when ``target_ess`` is None."""
+  action_clip: float | None = 1.0
+  """Clip sampled actions to ``[-x, x]``. None disables clipping."""
+  std_smoothing: float = 0.7
+  """MPOPI only: blend factor for the adapted std between iterations."""
+  min_std_scale: float = 0.2
+  """MPOPI only: lower bound on the adapted std, as a fraction of noise_std."""
+  max_std_scale: float = 3.0
+  """MPOPI only: upper bound on the adapted std, as a fraction of noise_std."""
+  seed: int = 0
+  """Seed of the planner's private random generator."""
+
+
+@dataclass
+class MpcPlan:
+  action: torch.Tensor
+  """``[N, A]`` first action of the optimized plan (noise-free)."""
+  std: torch.Tensor
+  """``[N, A]`` std of the final sampling distribution. Suitable as the
+  execution-noise std when a known behavior density is needed."""
+  best_return: torch.Tensor
+  """``[N]`` best sampled return in the last iteration."""
+  ess: torch.Tensor
+  """``[N]`` normalized ESS of the final MPPI weights."""
+
+
+@contextlib.contextmanager
+def _preserve_global_rng():
+  """mjlab env construction reseeds Python, NumPy and torch globally."""
+  states = (random.getstate(), np.random.get_state(), torch.get_rng_state())
+  cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+  try:
+    yield
+  finally:
+    random.setstate(states[0])
+    np.random.set_state(states[1])
+    torch.set_rng_state(states[2])
+    if cuda is not None:
+      torch.cuda.set_rng_state_all(cuda)
+
+
+def mppi_weights(
+  returns: torch.Tensor,
+  target_ess: float | None,
+  temperature: float = 0.1,
+  bisection_steps: int = 50,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Path-integral weights ``w_k ∝ exp((R_k - max R) / λ)`` per row.
+
+  With ``target_ess`` set, λ is chosen per row by bisection on ``log λ`` so
+  that the normalized ESS ``(Σw)² / (K Σw²)`` equals ``target_ess``. ESS grows
+  monotonically with λ, from 1/K (argmax) to 1 (uniform).
+
+  Args:
+    returns: ``[N, K]`` returns to maximize.
+
+  Returns:
+    ``(weights [N, K], normalized ESS [N])``.
+  """
+  num_samples = returns.shape[1]
+  advantage = returns - returns.max(dim=1, keepdim=True).values  # <= 0.
+
+  def weights_for(log_lam: torch.Tensor) -> torch.Tensor:
+    return torch.softmax(advantage / log_lam.exp()[:, None], dim=1)
+
+  def ess(w: torch.Tensor) -> torch.Tensor:
+    return 1.0 / (num_samples * w.square().sum(dim=1))
+
+  if target_ess is None:
+    lam = torch.full_like(returns[:, 0], math.log(temperature))
+    w = weights_for(lam)
+    return w, ess(w)
+
+  target = min(max(target_ess, 1.0 / num_samples), 1.0)
+  lo = torch.full_like(returns[:, 0], -20.0)
+  hi = torch.full_like(returns[:, 0], 20.0)
+  for _ in range(bisection_steps):
+    mid = 0.5 * (lo + hi)
+    too_greedy = ess(weights_for(mid)) < target
+    lo = torch.where(too_greedy, mid, lo)
+    hi = torch.where(too_greedy, hi, mid)
+  w = weights_for(0.5 * (lo + hi))
+  return w, ess(w)
+
+
+class SamplingMpc:
+  """MPPI / MPOPI planner for ``num_real`` real envs of an mjlab task."""
+
+  def __init__(
+    self,
+    task: str,
+    num_real: int,
+    cfg: SamplingMpcCfg,
+    device: str = "cpu",
+  ) -> None:
+    if cfg.iterations < 1 or cfg.num_samples < 2 or cfg.horizon < 1:
+      raise ValueError("Need iterations >= 1, num_samples >= 2 and horizon >= 1.")
+    self.cfg = cfg
+    self.num_real = num_real
+    self.device = torch.device(device)
+    env_cfg = load_env_cfg(task)
+    env_cfg.scene.num_envs = num_real * cfg.num_samples
+    env_cfg.auto_reset = False
+    env_cfg.terminations = {}  # Every sample is rolled out for the full horizon.
+    with _preserve_global_rng():
+      self.env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
+      self.env.reset()
+    self.action_dim = self.env.action_manager.total_action_dim
+    self.generator = torch.Generator(device=self.device).manual_seed(cfg.seed)
+    self.plan_seq = torch.zeros(
+      num_real, cfg.horizon, self.action_dim, device=self.device
+    )
+
+  def reset(self, env_ids: torch.Tensor | None = None) -> None:
+    """Forget the warm-start plan (e.g. after the real env was reset)."""
+    if env_ids is None:
+      self.plan_seq.zero_()
+    else:
+      self.plan_seq[env_ids] = 0.0
+
+  def plan(self, real_env: ManagerBasedRlEnv) -> MpcPlan:
+    """Optimize the plan from the real envs' current state."""
+    cfg = self.cfg
+    n, k, h, a = self.num_real, cfg.num_samples, cfg.horizon, self.action_dim
+    mean = self.plan_seq.clone()
+    std = torch.full_like(mean, cfg.noise_std)
+    min_std, max_std = (
+      cfg.min_std_scale * cfg.noise_std,
+      cfg.max_std_scale * cfg.noise_std,
+    )
+    returns: torch.Tensor | None = None
+    ess: torch.Tensor | None = None
+    for it in range(cfg.iterations):
+      noise = torch.randn(n, k, h, a, device=self.device, generator=self.generator)
+      noise[:, 0] = 0.0  # Nominal sample.
+      samples = mean[:, None] + std[:, None] * noise
+      if cfg.action_clip is not None:
+        samples = samples.clamp(-cfg.action_clip, cfg.action_clip)
+      returns = self._rollout(real_env, samples)
+      weights, ess = mppi_weights(returns, cfg.target_ess, cfg.temperature)
+      w = weights[:, :, None, None]
+      new_mean = (w * samples).sum(dim=1)
+      if it < cfg.iterations - 1:
+        # MPOPI: move and reshape the sampling distribution before the next batch.
+        var = (w * (samples - new_mean[:, None]).square()).sum(dim=1)
+        blended = (1 - cfg.std_smoothing) * std + cfg.std_smoothing * var.sqrt()
+        std = blended.clamp(min_std, max_std)
+      mean = new_mean
+    assert returns is not None and ess is not None
+    best_return = returns.max(dim=1).values
+    first = mean[:, 0].clone()
+    # Warm start: shift the plan one step and repeat the last action.
+    self.plan_seq = torch.cat([mean[:, 1:], mean[:, -1:]], dim=1)
+    return MpcPlan(
+      action=first, std=std[:, 0].clone(), best_return=best_return, ess=ess
+    )
+
+  def _copy_state(self, real_env: ManagerBasedRlEnv) -> None:
+    src, dst = real_env.sim.data, self.env.sim.data
+    for name in _STATE_FIELDS:
+      value = getattr(src, name)
+      if value.shape[-1] == 0:
+        continue
+      getattr(dst, name)[:] = value.repeat_interleave(self.cfg.num_samples, dim=0)
+    self.env.sim.forward()
+
+  def _rollout(
+    self, real_env: ManagerBasedRlEnv, samples: torch.Tensor
+  ) -> torch.Tensor:
+    """Sum of rewards of each ``[N, K, H, A]`` action sequence -> ``[N, K]``."""
+    n, k, h, a = samples.shape
+    self._copy_state(real_env)
+    total = torch.zeros(n * k, device=self.device)
+    flat = samples.reshape(n * k, h, a)
+    with torch.inference_mode():
+      for t in range(h):
+        self.env.step(flat[:, t])
+        total += self.env.reward_buf
+    return total.view(n, k)
+
+  def close(self) -> None:
+    self.env.close()

@@ -12,6 +12,10 @@ Added
   ``--agent.algorithm.mpopi.mode`` to ``naive_replay_ppo`` or ``mpopi_ppo`` adds
   importance-weighted samples from past rollouts to each PPO update. The default
   ``ppo`` mode constructs RSL-RL's ``PPO`` exactly as before.
+- Experimental sampling-based MPC (``mjlab.mpc.SamplingMpc``): MPPI, with an
+  MPOPI option that adapts the sampling distribution within a control step,
+  planning on a batched copy of an mjlab task with the task's own rewards.
+  ``scripts/mpc/eval_mpc.py`` evaluates it as a controller.
 
 Changed
 ^^^^^^^
